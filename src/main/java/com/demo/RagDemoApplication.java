@@ -15,18 +15,17 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.core.io.ClassPathResource;
 
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 
 /**
- * Minimal Retrieval-Augmented Generation (RAG) demo with Spring AI + Ollama.
+ * Multi-query (agentic) RAG demo — orchestrator / workers / aggregator.
  *
- * Flow:
- *   1. Load a document (FAQ file) and split it into chunks.
- *   2. Embed the chunks and store them in an in-memory vector store.
- *   3. For a question, retrieve the most relevant chunks (vector search).
- *   4. Inject those chunks into the prompt and let the model answer from them.
- *
- * The model answers grounded on the retrieved context instead of hallucinating.
+ *   1. ORCHESTRATOR: an LLM call splits a complex question into sub-questions.
+ *   2. WORKERS      : each sub-question is answered with RAG, in parallel (CompletableFuture).
+ *   3. AGGREGATOR   : an LLM call combines the sub-answers into one final answer.
  */
 @SpringBootApplication
 public class RagDemoApplication {
@@ -38,64 +37,111 @@ public class RagDemoApplication {
         SpringApplication.run(RagDemoApplication.class, args);
     }
 
-    /** In-memory vector store. Spring AI auto-wires the Ollama EmbeddingModel. */
     @Bean
     VectorStore vectorStore(EmbeddingModel embeddingModel) {
         return SimpleVectorStore.builder(embeddingModel).build();
     }
 
     @Bean
-    CommandLineRunner run(VectorStore vectorStore, ChatClient.Builder chatClientBuilder) {
+    CommandLineRunner run(VectorStore vectorStore, ChatClient.Builder builder) {
         return args -> {
-            ChatClient chat = chatClientBuilder.build();
+            ChatClient chat = builder.build();
+            ingest(vectorStore);
 
-            ingestDocuments(vectorStore);
+            String question =
+                    "What is your refund policy, how long does shipping take, and what payment methods do you accept?";
 
-            String question = "How long do refunds take?";
-            String answer = answer(vectorStore, chat, question);
+            long start = System.currentTimeMillis();
 
-            System.out.println("\n--- ANSWER ---\n" + answer);
+            // 1) ORCHESTRATOR: split the question into standalone sub-questions
+            List<String> subQuestions = decompose(chat, question);
+            System.out.println("\n--- DECOMPOSED into " + subQuestions.size() + " sub-questions ---");
+            subQuestions.forEach(sq -> System.out.println("* " + sq));
+
+            // 2) WORKERS (parallel): answer each sub-question with RAG
+            ExecutorService pool = Executors.newFixedThreadPool(subQuestions.size());
+            List<CompletableFuture<String>> futures = subQuestions.stream()
+                    .map(sq -> CompletableFuture.supplyAsync(() -> answerOne(vectorStore, chat, sq), pool))
+                    .toList();
+
+            List<String> subAnswers = futures.stream()
+                    .map(CompletableFuture::join)   // wait for all workers to finish
+                    .toList();
+            pool.shutdown();
+
+            // 3) AGGREGATOR: combine the sub-answers into one final answer
+            String finalAnswer = combine(chat, question, subQuestions, subAnswers);
+
+            long took = System.currentTimeMillis() - start;
+            System.out.println("\n--- FINAL ANSWER (" + took + " ms) ---\n" + finalAnswer);
         };
     }
 
-    /** Steps 1 & 2: read the file, split into chunks, embed and store. */
-    private void ingestDocuments(VectorStore vectorStore) {
-        TikaDocumentReader reader = new TikaDocumentReader(new ClassPathResource(SOURCE_FILE));
-        List<Document> rawDocuments = reader.get();
-
-        List<Document> chunks = new TokenTextSplitter().apply(rawDocuments);
+    /** Read the FAQ, split into chunks, embed and store. */
+    private void ingest(VectorStore vectorStore) {
+        var reader = new TikaDocumentReader(new ClassPathResource(SOURCE_FILE));
+        List<Document> chunks = new TokenTextSplitter().apply(reader.get());
         vectorStore.add(chunks);
-
         System.out.println("Loaded " + chunks.size() + " chunks from " + SOURCE_FILE);
     }
 
-    /** Steps 3 & 4: retrieve relevant chunks, build the prompt, call the model. */
-    private String answer(VectorStore vectorStore, ChatClient chat, String question) {
-        // 3) RETRIEVE: find the most relevant chunks for this question
+    /** ORCHESTRATOR: ask the model to break the question into standalone sub-questions. */
+    private List<String> decompose(ChatClient chat, String question) {
+        String prompt = """
+            Break the user's question into simple, standalone sub-questions, one per line.
+            If it is already simple, return just that one line.
+            Return ONLY the sub-questions - no numbering, no extra text.
+
+            Question: %s
+            """.formatted(question);
+
+        String raw = chat.prompt().user(prompt).call().content();
+        return raw.lines()
+                .map(String::trim)
+                .filter(line -> !line.isBlank())
+                .toList();
+    }
+
+    /** WORKER: standard RAG for one sub-question (retrieve + generate). */
+    private String answerOne(VectorStore vectorStore, ChatClient chat, String question) {
         List<Document> hits = vectorStore.similaritySearch(
                 SearchRequest.builder().query(question).topK(TOP_K).build());
 
-        System.out.println("\n--- RETRIEVED (what vector search found) ---");
-        hits.forEach(doc -> System.out.println("* " + doc.getText()));
-
-        // 3b) build the context from the retrieved chunks
         String context = hits.stream()
                 .map(Document::getText)
                 .collect(Collectors.joining("\n"));
 
-        // 4) AUGMENT: put the context into the prompt
         String prompt = """
-                Answer using ONLY the context below. If the answer is not there, say you don't know.
+            Answer using ONLY the context below. If the answer is not there, say you don't know.
+            Context:
+            %s
+            Question: %s
+            """.formatted(context, question);
 
-                Context:
-                %s
+        String answer = chat.prompt().user(prompt).call().content();
+        System.out.println("  [worker on " + Thread.currentThread().getName() + "] "
+                + question + " -> " + answer.replaceAll("\\s+", " ").trim());
+        return answer;
+    }
 
-                Question: %s
-                """.formatted(context, question);
+    /** AGGREGATOR: combine the sub-answers into one final answer to the original question. */
+    private String combine(ChatClient chat, String originalQuestion,
+                           List<String> subQuestions, List<String> subAnswers) {
+        StringBuilder pairs = new StringBuilder();
+        for (int i = 0; i < subQuestions.size(); i++) {
+            pairs.append("Q: ").append(subQuestions.get(i)).append("\n")
+                    .append("A: ").append(subAnswers.get(i)).append("\n\n");
+        }
 
-        System.out.println("\n--- FINAL PROMPT (what the model actually sees) ---\n" + prompt);
+        String prompt = """
+            Using the sub-answers below, write one clear, complete answer to the user's original question.
 
-        // 4b) GENERATE: call the LLM
+            Original question: %s
+
+            Sub-answers:
+            %s
+            """.formatted(originalQuestion, pairs);
+
         return chat.prompt().user(prompt).call().content();
     }
 }
